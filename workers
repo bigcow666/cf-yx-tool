@@ -1,0 +1,250 @@
+const directDomains = [
+  { name: "带宽特化-vip.cf.3666888.xyz", domain: "vip.cf.3666888.xyz" },
+  { name: "带宽特化-cdn.262832.xyz", domain: "cdn.262832.xyz" },
+  { name: "带宽特化-staticdelivery.nexusmods.com", domain: "staticdelivery.nexusmods.com" },
+  { name: "带宽特化-freeyx.cloudflare88.eu.org", domain: "freeyx.cloudflare88.eu.org" },
+  { name: "带宽特化-www.shopify.com", domain: "www.shopify.com" },
+  { domain: "store.ubi.com" },
+  { domain: "saas.sin.fan" },
+  { domain: "youxuan.cf.090227.xyz" },
+  { domain: "cf.090227.xyz" },
+  { domain: "cf.0sm.com" },
+  { domain: "ct.cloudflare.byoip.top" },
+  { domain: "cfip.1323123.xyz" },
+  { domain: "cf.877771.xyz" },
+  { name: "cloudflare.182682.xyz", domain: "cloudflare.182682.xyz" },
+  { domain: "cloudflare-ip.mofashi.ltd" },
+  { domain: "cf.zhetengsha.eu.org" },
+  { domain: "xn--b6gac.eu.org" },
+];
+
+// 默认优选IP来源URL
+const defaultIPURL =
+  "https://raw.githubusercontent.com/qwer-search/bestip/refs/heads/main/kejilandbestip.txt";
+
+export default {
+  async fetch(request, env) {
+    // 拦截或路径错误时直接返回空 404
+    const decoy = () => new Response(null, { status: 404 });
+
+    // 拦截普通浏览器，仅放行常见代理客户端拉取订阅
+    const ua = (request.headers.get("user-agent") || "").toLowerCase();
+    const isClient =
+      /(v2ray|xray|sing-box|clash|meta|mihomo|shadowrocket|neko|karing|hiddify|surge|quantumult|loon|stash|curl|go-http-client)/i.test(
+        ua
+      );
+    if (!isClient) {
+      return decoy();
+    }
+
+    const url = new URL(request.url);
+    const subPath = (env.SUB_PATH || "sub").replace(/^\/+|\/+$/g, "");
+    const rawPath = url.pathname.replace(/^\/+|\/+$/g, "");
+    const parts = rawPath.split("/").filter(Boolean);
+
+    // 严格校验 /SUB_PATH/UUID
+    if (parts.length !== 2 || parts[0] !== subPath) {
+      return decoy();
+    }
+
+    const rawNodes = (env.NODES || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#") && line.includes("://"));
+
+    if (rawNodes.length === 0) {
+      return decoy();
+    }
+
+    const parsedNodes = rawNodes.map(parseNodeLink).filter(Boolean);
+    const targetUuid = decodeURIComponent(parts[1]);
+    const matchedNodes = parsedNodes.filter((n) => n.uuid === targetUuid);
+
+    if (matchedNodes.length === 0) {
+      return decoy();
+    }
+
+    const bestList = await getMergedBestList(env);
+    const outputLinks = [];
+
+    for (const node of matchedNodes) {
+      if (bestList.length === 0) {
+        outputLinks.push(node.raw);
+        continue;
+      }
+
+      for (const best of bestList) {
+        const finalHost = formatHost(best.host);
+        const finalPort = best.port || node.port || "443";
+        const tag = best.label || best.host;
+        const newRemark = node.remark ? `${node.remark}-${tag}` : tag;
+
+        const rebuilt =
+          `${node.protocol}://${node.uuid}@${finalHost}:${finalPort}` +
+          `${node.query ? "?" + node.query : ""}` +
+          `#${encodeURIComponent(newRemark)}`;
+
+        outputLinks.push(rebuilt);
+      }
+    }
+
+    const plainText = outputLinks.join("\n");
+
+    return new Response(utf8ToBase64(plainText), {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    });
+  },
+};
+
+/**
+ * 合并并去重：
+ * 1. 环境变量 BEST_IPS
+ * 2. 自带 directDomains
+ * 3. 远程 IP_URL（未设置默认用 defaultIPURL；设为 none/off 则关闭）
+ */
+async function getMergedBestList(env) {
+  const merged = [];
+  const seen = new Set();
+
+  const addItem = (item) => {
+    if (!item || !item.host) return;
+    const key = `${item.host.toLowerCase()}:${item.port || "443"}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(item);
+  };
+
+  if (env.BEST_IPS) {
+    for (const item of parseBestList(env.BEST_IPS)) {
+      addItem(item);
+    }
+  }
+
+  for (const d of directDomains) {
+    if (!d.domain) continue;
+    addItem({
+      host: d.domain.trim(),
+      port: "",
+      label: (d.name || d.domain).trim(),
+    });
+  }
+
+  const targetUrl =
+    env.IP_URL !== undefined ? env.IP_URL.trim() : defaultIPURL;
+
+  if (
+    targetUrl &&
+    targetUrl.toLowerCase() !== "none" &&
+    targetUrl.toLowerCase() !== "off"
+  ) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const resp = await fetch(targetUrl, {
+        signal: controller.signal,
+        headers: { "user-agent": "Mozilla/5.0" },
+      });
+      clearTimeout(timer);
+
+      if (resp.ok) {
+        const text = await resp.text();
+        for (const item of parseBestList(text)) {
+          addItem(item);
+        }
+      }
+    } catch (_) {
+      // 拉取失败或超时则自动回退到已有列表
+    }
+  }
+
+  return merged;
+}
+
+function parseNodeLink(raw) {
+  const hashIdx = raw.indexOf("#");
+  const beforeHash = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
+  const rawRemark = hashIdx >= 0 ? raw.slice(hashIdx + 1) : "";
+
+  const queryIdx = beforeHash.indexOf("?");
+  const beforeQuery = queryIdx >= 0 ? beforeHash.slice(0, queryIdx) : beforeHash;
+  const query = queryIdx >= 0 ? beforeHash.slice(queryIdx + 1) : "";
+
+  const protoIdx = beforeQuery.indexOf("://");
+  if (protoIdx < 0) return null;
+  const protocol = beforeQuery.slice(0, protoIdx);
+  const authority = beforeQuery.slice(protoIdx + 3);
+
+  const atIdx = authority.lastIndexOf("@");
+  if (atIdx < 0) return null;
+  const uuid = authority.slice(0, atIdx);
+  const hostPort = authority.slice(atIdx + 1);
+
+  let port = "443";
+  const ipv6Match = hostPort.match(/^\[[^\]]+\]:(\d+)$/);
+  if (ipv6Match) {
+    port = ipv6Match[1];
+  } else {
+    const colonIdx = hostPort.lastIndexOf(":");
+    if (colonIdx > 0 && !hostPort.includes("]")) {
+      port = hostPort.slice(colonIdx + 1);
+    }
+  }
+
+  let remark = rawRemark;
+  try {
+    remark = decodeURIComponent(rawRemark);
+  } catch (_) {}
+
+  return { raw, protocol, uuid, port, query, remark };
+}
+
+function parseBestList(text) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .map((line) => {
+      const hashIdx = line.indexOf("#");
+      const main = (hashIdx >= 0 ? line.slice(0, hashIdx) : line).trim();
+      const label = (hashIdx >= 0 ? line.slice(hashIdx + 1) : "").trim();
+
+      let host = main;
+      let port = "";
+
+      const ipv6WithPort = main.match(/^\[([^\]]+)\]:(\d+)$/);
+      const ipv6Only = main.match(/^\[([^\]]+)\]$/);
+
+      if (ipv6WithPort) {
+        host = ipv6WithPort[1];
+        port = ipv6WithPort[2];
+      } else if (ipv6Only) {
+        host = ipv6Only[1];
+      } else if (main.includes(":") && main.indexOf(":") === main.lastIndexOf(":")) {
+        const [h, p] = main.split(":");
+        host = h.trim();
+        port = p.trim();
+      }
+
+      return { host, port, label };
+    })
+    .filter((item) => item.host);
+}
+
+function formatHost(host) {
+  if (host.includes(":") && !host.startsWith("[")) {
+    return `[${host}]`;
+  }
+  return host;
+}
+
+function utf8ToBase64(str) {
+  const bytes = new TextEncoder().encode(str);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
